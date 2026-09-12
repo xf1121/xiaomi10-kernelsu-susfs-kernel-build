@@ -140,6 +140,15 @@ jobs:
             echo "ERROR: CONFIG_KSU is not enabled"
             exit 1
           fi
+            - name: Fix KernelSU page-table header compatibility
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+
+          if [ ! -f include/linux/pgtable.h ]; then
+            test -f arch/arm64/include/asm/pgtable.h
+            sed -i 's|#include <linux/pgtable.h>|#include <asm/pgtable.h>|' \
+              KernelSU-Next/kernel/feature/sucompat.c
+          fi
       - name: 7. Build kernel
         run: |
           export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang/bin:$PATH"

@@ -1,0 +1,189 @@
+name: Build Xiaomi 10 Pro - KernelSU Next v3.3.0
+
+run-name: cmi | N0Kernel 4.19 | KernelSU Next v3.3.0
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    env:
+      KSU_VERSION: v3.3.0
+      DEVICE: cmi
+
+    steps:
+      - name: 1. Prepare workspace
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/kernel_workspace"
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            git \
+            curl \
+            wget \
+            zip \
+            unzip \
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev \
+            ccache
+
+      - name: 2. Download Clang
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
+
+          wget -q \
+            https://github.com/ZyCromerZ/Clang/releases/download/19.0.0git-20240125-release/Clang-19.0.0git-20240125.tar.gz
+
+          mkdir -p clang
+
+          tar -xzf \
+            Clang-19.0.0git-20240125.tar.gz \
+            -C clang
+
+          clang/bin/clang --version
+
+      - name: 3. Clone N0Kernel source
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
+
+          git clone \
+            https://github.com/clcwpwqi/kernel_xiaomi_sm8250_n0kernel \
+            --depth=1 \
+            android_kernel
+
+          git clone \
+            https://github.com/clcwpwqi/kernel.git \
+            --depth=1 \
+            packaging
+
+      - name: 4. Integrate official KernelSU Next v3.3.0
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+
+          curl -LSs \
+            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/v3.3.0/kernel/setup.sh" \
+            | bash -s v3.3.0
+
+          echo "===== KernelSU source ====="
+          git -C KernelSU-Next describe --tags --always || true
+          git -C KernelSU-Next log -1 --oneline
+
+      - name: 5. Generate cmi config
+        run: |
+          export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang/bin:$PATH"
+
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+
+          make -j"$(nproc)" \
+            O=out \
+            ARCH=arm64 \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-buildroot-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            vendor/cmi_defconfig
+
+      - name: 6. Enable KernelSU requirements
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+
+          ./scripts/config --file out/.config \
+            -e KPROBES \
+            -e KPROBE_EVENTS \
+            -e EXT4_FS \
+            -e KSU
+
+          export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang/bin:$PATH"
+
+          make -j"$(nproc)" \
+            O=out \
+            ARCH=arm64 \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-buildroot-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            olddefconfig
+
+          echo "===== Verify config ====="
+
+          grep -E \
+            'CONFIG_(KSU|KPROBES|KPROBE_EVENTS|EXT4_FS)=' \
+            out/.config || true
+
+          if ! grep -q '^CONFIG_KSU=y' out/.config; then
+            echo "ERROR: CONFIG_KSU is not enabled"
+            exit 1
+          fi
+
+      - name: 7. Build kernel
+        run: |
+          export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang/bin:$PATH"
+
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+
+          make -j"$(nproc)" \
+            O=out \
+            ARCH=arm64 \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi-
+
+      - name: 8. Verify kernel Image
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+
+          IMAGE="out/arch/arm64/boot/Image"
+
+          if [ ! -f "$IMAGE" ]; then
+            echo "ERROR: Kernel Image was not generated"
+            exit 1
+          fi
+
+          ls -lh "$IMAGE"
+
+          echo "===== Linux version ====="
+          strings "$IMAGE" | grep -m1 "Linux version" || true
+
+          echo "===== KernelSU strings ====="
+          strings "$IMAGE" | grep -i -m10 "KernelSU" || true
+
+      - name: 9. Create AnyKernel3 flash package
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
+
+          mkdir -p packaging/Anykernel/kernels/miui
+
+          cp \
+            android_kernel/out/arch/arm64/boot/Image \
+            packaging/Anykernel/kernels/miui/Image
+
+          cd packaging/Anykernel
+
+          zip -r \
+            "$GITHUB_WORKSPACE/cmi-N0Kernel-KernelSU-Next-v3.3.0.zip" \
+            .
+
+          ls -lh \
+            "$GITHUB_WORKSPACE/cmi-N0Kernel-KernelSU-Next-v3.3.0.zip"
+
+      - name: 10. Upload flash package
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmi-N0Kernel-KernelSU-Next-v3.3.0
+          path: cmi-N0Kernel-KernelSU-Next-v3.3.0.zip
+          retention-days: 7
+          compression-level: 0

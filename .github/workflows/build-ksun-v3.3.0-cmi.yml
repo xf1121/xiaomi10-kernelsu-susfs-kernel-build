@@ -160,6 +160,22 @@ jobs:
 
           echo "===== Verify compatibility changes ====="
           grep -nE 'pgtable.h|strncpy_from_unsafe_user' "$KSU_FILE"
+     - name: Fix KernelSU kernel-write compatibility
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+
+          PATCH_FILE="KernelSU-Next/kernel/hook/arm64/patch_memory.c"
+          test -f "$PATCH_FILE"
+
+          if ! grep -q 'copy_to_kernel_nofault' include/linux/uaccess.h; then
+            grep -q 'probe_kernel_write' include/linux/uaccess.h
+            grep -q 'probe_kernel_write' mm/maccess.c
+            sed -i 's/copy_to_kernel_nofault/probe_kernel_write/g' "$PATCH_FILE"
+          fi
+
+          echo "===== Verify kernel-write compatibility ====="
+          grep -nE 'copy_to_kernel_nofault|probe_kernel_write' "$PATCH_FILE"
+          
       - name: 7. Build kernel
         run: |
           export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang/bin:$PATH"

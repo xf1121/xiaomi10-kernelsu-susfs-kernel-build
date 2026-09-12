@@ -140,7 +140,7 @@ jobs:
             echo "ERROR: CONFIG_KSU is not enabled"
             exit 1
           fi
-            - name: Fix KernelSU page-table header compatibility
+      - name: Fix KernelSU page-table header compatibility
         run: |
           cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
 

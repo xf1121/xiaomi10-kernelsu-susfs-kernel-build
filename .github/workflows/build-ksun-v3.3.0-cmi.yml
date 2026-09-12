@@ -160,7 +160,7 @@ jobs:
 
           echo "===== Verify compatibility changes ====="
           grep -nE 'pgtable.h|strncpy_from_unsafe_user' "$KSU_FILE"
-     - name: Fix KernelSU kernel-write compatibility
+      - name: Fix KernelSU kernel-write compatibility
         run: |
           cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
 

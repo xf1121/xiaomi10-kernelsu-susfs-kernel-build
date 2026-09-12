@@ -97,8 +97,8 @@ jobs:
           cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
 
           ./scripts/config --file out/.config \
+            -e MODULES \
             -e KPROBES \
-            -e KPROBE_EVENTS \
             -e EXT4_FS \
             -e KSU
 
@@ -115,17 +115,31 @@ jobs:
             CROSS_COMPILE_ARM32=arm-linux-androideabi- \
             olddefconfig
 
-          echo "===== Verify config ====="
+          echo "===== Verify KernelSU config ====="
 
           grep -E \
-            'CONFIG_(KSU|KPROBES|KPROBE_EVENTS|EXT4_FS)=' \
+            'CONFIG_(MODULES|KPROBES|KSU|EXT4_FS)=' \
             out/.config || true
+
+          if ! grep -q '^CONFIG_MODULES=y' out/.config; then
+            echo "ERROR: CONFIG_MODULES is not enabled"
+            exit 1
+          fi
+
+          if ! grep -q '^CONFIG_KPROBES=y' out/.config; then
+            echo "ERROR: CONFIG_KPROBES is not enabled"
+            exit 1
+          fi
+
+          if ! grep -q '^CONFIG_EXT4_FS=y' out/.config; then
+            echo "ERROR: CONFIG_EXT4_FS is not enabled"
+            exit 1
+          fi
 
           if ! grep -q '^CONFIG_KSU=y' out/.config; then
             echo "ERROR: CONFIG_KSU is not enabled"
             exit 1
           fi
-
       - name: 7. Build kernel
         run: |
           export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang/bin:$PATH"

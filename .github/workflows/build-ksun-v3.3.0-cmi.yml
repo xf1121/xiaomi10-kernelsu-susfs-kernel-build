@@ -140,15 +140,26 @@ jobs:
             echo "ERROR: CONFIG_KSU is not enabled"
             exit 1
           fi
-      - name: Fix KernelSU page-table header compatibility
+      - name: Fix KernelSU compatibility for N0Kernel 4.19
         run: |
           cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
 
+          KSU_FILE="KernelSU-Next/kernel/feature/sucompat.c"
+          test -f "$KSU_FILE"
+
           if [ ! -f include/linux/pgtable.h ]; then
             test -f arch/arm64/include/asm/pgtable.h
-            sed -i 's|#include <linux/pgtable.h>|#include <asm/pgtable.h>|' \
-              KernelSU-Next/kernel/feature/sucompat.c
+            sed -i 's|#include <linux/pgtable.h>|#include <asm/pgtable.h>|' "$KSU_FILE"
           fi
+
+          if ! grep -q 'strncpy_from_user_nofault' include/linux/uaccess.h; then
+            grep -q 'strncpy_from_unsafe_user' include/linux/uaccess.h
+            grep -q 'strncpy_from_unsafe_user' mm/maccess.c
+            sed -i 's/strncpy_from_user_nofault/strncpy_from_unsafe_user/g' "$KSU_FILE"
+          fi
+
+          echo "===== Verify compatibility changes ====="
+          grep -nE 'pgtable.h|strncpy_from_unsafe_user' "$KSU_FILE"
       - name: 7. Build kernel
         run: |
           export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang/bin:$PATH"

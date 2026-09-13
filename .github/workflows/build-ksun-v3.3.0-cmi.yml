@@ -9,6 +9,914 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     timeout-minutes: 60
+name: Build Xiaomi 10 Pro - KernelSU Next v3.3.0
+
+run-name: cmi | N0Kernel 4.19 | KernelSU Next v3.3.0
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    env:
+      KSU_VERSION: v3.3.0
+      DEVICE: cmi
+
+    steps:
+      - name: 1. Prepare workspace
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/kernel_workspace"
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            git \
+            curl \
+            wget \
+            zip \
+            unzip \
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev \
+            ccache
+
+      - name: 2. Download Clang
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
+
+          wget -q \
+            https://github.com/ZyCromerZ/Clang/releases/download/19.0.0git-20240125-release/Clang-19.0.0git-20240125.tar.gz
+
+          mkdir -p clang
+
+          tar -xzf \
+            Clang-19.0.0git-20240125.tar.gz \
+            -C clang
+
+          clang/bin/clang --version
+
+      - name: 3. Clone N0Kernel source
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
+
+          git clone \
+            https://github.com/clcwpwqi/kernel_xiaomi_sm8250_n0kernel \
+            --depth=1 \
+            android_kernel
+
+          git -C android_kernel fetch --depth=1 origin 8e5ed277b141f94ed16cda850445f43b16305ce2
+          git -C android_kernel checkout --detach FETCH_HEAD
+
+          git clone \
+            https://github.com/clcwpwqi/kernel.git \
+            --depth=1 \
+            packaging
+
+      - name: 4. Integrate official KernelSU Next v3.3.0
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+
+          curl -LSs \
+            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/v3.3.0/kernel/setup.sh" \
+            | bash -s v3.3.0
+
+          echo "===== KernelSU source ====="
+          git -C KernelSU-Next describe --tags --always || true
+          git -C KernelSU-Next log -1 --oneline
+          test "$(git -C KernelSU-Next rev-parse HEAD)" = "3b18216f71df189ab3d1b1ce0bdb21be1268e771"
+
+      - name: 5. Generate cmi config
+        run: |
+          export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang/bin:$PATH"
+
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+
+          make -j"$(nproc)" \
+            O=out \
+            ARCH=arm64 \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-buildroot-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            vendor/cmi_defconfig
+
+      - name: 6. Enable KernelSU requirements
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+
+          ./scripts/config --file out/.config \
+            -e MODULES \
+            -e KPROBES \
+            -e EXT4_FS \
+            -e KSU
+
+          export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang/bin:$PATH"
+
+          make -j"$(nproc)" \
+            O=out \
+            ARCH=arm64 \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-buildroot-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            olddefconfig
+
+          echo "===== Verify KernelSU config ====="
+
+          grep -E \
+            'CONFIG_(MODULES|KPROBES|KSU|EXT4_FS)=' \
+            out/.config || true
+
+          if ! grep -q '^CONFIG_MODULES=y' out/.config; then
+            echo "ERROR: CONFIG_MODULES is not enabled"
+            exit 1
+          fi
+
+          if ! grep -q '^CONFIG_KPROBES=y' out/.config; then
+            echo "ERROR: CONFIG_KPROBES is not enabled"
+            exit 1
+          fi
+
+          if ! grep -q '^CONFIG_EXT4_FS=y' out/.config; then
+            echo "ERROR: CONFIG_EXT4_FS is not enabled"
+            exit 1
+          fi
+
+          if ! grep -q '^CONFIG_KSU=y' out/.config; then
+            echo "ERROR: CONFIG_KSU is not enabled"
+            exit 1
+          fi
+      - name: Fix KernelSU compatibility for N0Kernel 4.19
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+
+          KSU_FILE="KernelSU-Next/kernel/feature/sucompat.c"
+          test -f "$KSU_FILE"
+
+          if [ ! -f include/linux/pgtable.h ]; then
+            test -f arch/arm64/include/asm/pgtable.h
+            sed -i 's|#include <linux/pgtable.h>|#include <asm/pgtable.h>|' "$KSU_FILE"
+          fi
+
+          if ! grep -q 'strncpy_from_user_nofault' include/linux/uaccess.h; then
+            grep -q 'strncpy_from_unsafe_user' include/linux/uaccess.h
+            grep -q 'strncpy_from_unsafe_user' mm/maccess.c
+            sed -i 's/strncpy_from_user_nofault/strncpy_from_unsafe_user/g' "$KSU_FILE"
+          fi
+
+          echo "===== Verify compatibility changes ====="
+          grep -nE 'pgtable.h|strncpy_from_unsafe_user' "$KSU_FILE"
+      - name: Fix KernelSU kernel-write compatibility
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+
+          PATCH_FILE="KernelSU-Next/kernel/hook/arm64/patch_memory.c"
+          test -f "$PATCH_FILE"
+
+          if ! grep -q 'copy_to_kernel_nofault' include/linux/uaccess.h; then
+            grep -q 'probe_kernel_write' include/linux/uaccess.h
+            grep -q 'probe_kernel_write' mm/maccess.c
+            sed -i 's/copy_to_kernel_nofault/probe_kernel_write/g' "$PATCH_FILE"
+          fi
+
+          echo "===== Verify kernel-write compatibility ====="
+          grep -nE 'copy_to_kernel_nofault|probe_kernel_write' "$PATCH_FILE"
+          
+      - name: Adapt file wrapper for N0Kernel 4.19
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+          python3 - <<'PY'
+          """Targeted KernelSU Next v3.3.0 file-wrapper port for this N0Kernel 4.19.
+          
+          This is a downstream compatibility patch, not an upstream release.
+          It deliberately fails on unexpected source layouts.
+          """
+          from pathlib import Path
+          import re
+          
+          
+          def patch_wrapper(source, fs_header, security_header, objsec_header):
+              for member in ('clone_file_range', 'dedupe_file_range'):
+                  if not re.search(r'\(\*' + member + r'\)', fs_header):
+                      raise RuntimeError('Missing required 4.19 file operation: ' + member)
+              for member in ('iopoll', 'remap_file_range'):
+                  if re.search(r'\(\*' + member + r'\)', fs_header):
+                      raise RuntimeError('Unexpected backported operation: ' + member)
+              if 'security_inode_init_security_anon' in security_header:
+                  raise RuntimeError('Native anonymous-inode security hook exists; review port')
+              if re.search(r'\bselinux_inode\s*\(', objsec_header):
+                  raise RuntimeError('Unexpected SELinux blob layout; review port')
+              for token in ('LABEL_INITIALIZED', 'struct inode_security_struct', 'sclass'):
+                  if token not in objsec_header:
+                      raise RuntimeError('Unexpected SELinux definitions: ' + token)
+          
+              def replace_once(old, new):
+                  nonlocal source
+                  if source.count(old) != 1:
+                      raise RuntimeError('Expected exactly one source match: ' + old[:90])
+                  source = source.replace(old, new, 1)
+          
+              replace_once('#else\nstatic int ksu_wrapper_iopoll',
+                           '#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n'
+                           'static int ksu_wrapper_iopoll')
+              old = '    p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;'
+              replace_once(old, '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n'
+                           + old + '\n#endif')
+          
+              # 4.19 exposes clone and dedupe separately; preserve both forwarding paths.
+              old_start = 'static loff_t ksu_wrapper_remap_file_range('
+              replace_once(old_start, '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n'
+                           + old_start)
+              legacy_ops = '''#else
+          static int ksu_wrapper_clone_file_range(struct file *file_in, loff_t pos_in,
+                                                 struct file *file_out, loff_t pos_out,
+                                                 u64 len)
+          {
+              struct ksu_file_wrapper *data = file_in->private_data;
+              return data->orig->f_op->clone_file_range(data->orig, pos_in,
+                                                       file_out, pos_out, len);
+          }
+          
+          static int ksu_wrapper_dedupe_file_range(struct file *file_in, loff_t pos_in,
+                                                  struct file *file_out, loff_t pos_out,
+                                                  u64 len)
+          {
+              struct ksu_file_wrapper *data = file_out->private_data;
+              return data->orig->f_op->dedupe_file_range(file_in, pos_in,
+                                                        data->orig, pos_out, len);
+          }
+          #endif
+          
+          '''
+              replace_once('static int ksu_wrapper_fadvise(',
+                           legacy_ops + 'static int ksu_wrapper_fadvise(')
+              old = '''    p->ops.remap_file_range =
+                  fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;'''
+              replace_once(old, '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n'
+                           + old + '''
+          #else
+              p->ops.clone_file_range =
+                  fp->f_op->clone_file_range ? ksu_wrapper_clone_file_range : NULL;
+              p->ops.dedupe_file_range =
+                  fp->f_op->dedupe_file_range ? ksu_wrapper_dedupe_file_range : NULL;
+          #endif''')
+          
+              # This is local to KSU's private wrapper, not a substitute for a global LSM
+              # hook. The release already labels the wrapper with ksu_file_sid. On 4.19,
+              # initialize that label before the inode is published and keep S_PRIVATE
+              # until initialization succeeds. Do not change SELinux enforcement.
+              helper = '''/* N0Kernel 4.19 stores the SELinux inode blob in i_security. */
+          static int ksu_init_wrapper_security_419(struct inode *inode)
+          {
+              struct inode_security_struct *isec = inode->i_security;
+          
+              if (!isec || !ksu_file_sid)
+                  return -EINVAL;
+          
+              /* Private, freshly allocated inode; no concurrent readers yet. */
+              isec->sid = ksu_file_sid;
+              isec->sclass = SECCLASS_FILE;
+              isec->initialized = LABEL_INITIALIZED;
+              return 0;
+          }
+          
+          '''
+              replace_once('static struct inode *\nksu_anon_inode_make_secure_inode(',
+                           helper + 'static struct inode *\nksu_anon_inode_make_secure_inode(')
+              replace_once('    const struct qstr qname = QSTR_INIT(name, strlen(name));\n', '')
+              old = '''    inode->i_flags &= ~S_PRIVATE;
+              error = security_inode_init_security_anon(inode, &qname, context_inode);
+              if (error) {
+                  iput(inode);
+                  return ERR_PTR(error);
+              }
+              return inode;'''
+              new = '''    error = ksu_init_wrapper_security_419(inode);
+              if (error) {
+                  iput(inode);
+                  return ERR_PTR(error);
+              }
+              inode->i_flags &= ~S_PRIVATE;
+              return inode;'''
+              replace_once(old, new)
+              replace_once('selinux_inode(wrapper_inode)', 'wrapper_inode->i_security')
+              return source
+          
+          
+          def main():
+              version = Path('Makefile').read_text()
+              if not (re.search(r'^VERSION\s*=\s*4\s*$', version, re.M)
+                      and re.search(r'^PATCHLEVEL\s*=\s*19\s*$', version, re.M)):
+                  raise RuntimeError('This compatibility patch is only for N0Kernel 4.19')
+              config = Path('out/.config').read_text()
+              if 'CONFIG_SECURITY_SELINUX=y' not in config:
+                  raise RuntimeError('This port requires CONFIG_SECURITY_SELINUX=y')
+              target = Path('KernelSU-Next/kernel/infra/file_wrapper.c')
+              result = patch_wrapper(
+                  target.read_text(), Path('include/linux/fs.h').read_text(),
+                  Path('include/linux/security.h').read_text(),
+                  Path('security/selinux/include/objsec.h').read_text())
+              target.write_text(result)
+              print('Applied N0Kernel 4.19 file-wrapper compatibility patch')
+          
+          
+          if __name__ == '__main__':
+              main()
+          PY
+          git -C KernelSU-Next diff -- kernel > "$GITHUB_WORKSPACE/compat419.diff"
+          { git rev-parse HEAD; git -C KernelSU-Next rev-parse HEAD; } > "$GITHUB_WORKSPACE/source-revisions.txt"
+
+      - name: Adapt seccomp helpers for kernel without action cache
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          import re
+          
+          native = Path("kernel/seccomp.c").read_text()
+          native_code = re.sub(r"/\*.*?\*/|//[^\n]*", "", native, flags=re.S)
+          match = re.search(r"struct seccomp_filter\s*\{([^}]+)\};", native_code)
+          expected = "refcount_t usage; bool log; struct seccomp_filter *prev; struct bpf_prog *prog;"
+          normalize = lambda s: re.sub(r"\s+", "", s)
+          if not match or normalize(match.group(1)) != normalize(expected):
+              raise RuntimeError("Unexpected native seccomp_filter layout; review required")
+          if re.search(r"\baction_cache\b|\bcache\b", native_code):
+              raise RuntimeError("Native seccomp cache detected; do not apply no-cache adapter")
+          if "BPF_PROG_RUN(f->prog, sd)" not in native_code:
+              raise RuntimeError("Expected native BPF filtering path is missing")
+          
+          target = Path("KernelSU-Next/kernel/infra/seccomp_cache.c")
+          source = target.read_text()
+          digest = hashlib.sha256(source.strip().encode()).hexdigest()
+          if digest != "be0f193ee23a323d39c9d33b4e928a128d10e3b0a9ccd333e01b9335cd5ef65f":
+              raise RuntimeError("Unexpected KernelSU cache source; review required")
+          
+          target.write_text("""// SPDX-License-Identifier: GPL-2.0-only
+          /*
+           * This pinned N0Kernel 4.19 has no seccomp action cache.
+           * Cache maintenance is therefore empty. Native BPF filtering remains intact.
+           * Never access the newer kernel's private seccomp_filter layout on 4.19.
+           */
+          #include <linux/seccomp.h>
+          #include "infra/seccomp_cache.h"
+          
+          void ksu_seccomp_clear_cache(struct seccomp_filter *filter, int nr)
+          {
+              (void)filter;
+              (void)nr;
+          }
+          
+          void ksu_seccomp_allow_cache(struct seccomp_filter *filter, int nr)
+          {
+              (void)filter;
+              (void)nr;
+          }
+          """)
+          print("Applied seccomp no-cache adapter; native kernel/seccomp.c unchanged")
+          PY
+          git -C KernelSU-Next diff -- kernel > "$GITHUB_WORKSPACE/compat419.diff"
+
+      - name: 7. Build kernel
+        run: |
+          set -o pipefail
+          export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang/bin:$PATH"
+
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+
+          make -j"$(nproc)" \
+            O=out \
+            ARCH=arm64 \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: 8. Verify kernel Image
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+
+          IMAGE="out/arch/arm64/boot/Image"
+
+          if [ ! -f "$IMAGE" ]; then
+            echo "ERROR: Kernel Image was not generated"
+            exit 1
+          fi
+
+          ls -lh "$IMAGE"
+
+          echo "===== Linux version ====="
+          strings "$IMAGE" | grep -m1 "Linux version" || true
+
+          echo "===== KernelSU strings ====="
+          strings "$IMAGE" | grep -i -m10 "KernelSU" || true
+
+      - name: 9. Create AnyKernel3 flash package
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
+
+          mkdir -p packaging/Anykernel/kernels/miui
+
+          cp \
+            android_kernel/out/arch/arm64/boot/Image \
+            packaging/Anykernel/kernels/miui/Image
+
+          cd packaging/Anykernel
+
+          zip -r \
+            "$GITHUB_WORKSPACE/cmi-N0Kernel-KernelSU-Next-v3.3.0-compat419-r2.zip" \
+            .
+
+          ls -lh \
+            "$GITHUB_WORKSPACE/cmi-N0Kernel-KernelSU-Next-v3.3.0-compat419-r2.zip"
+
+      - name: 10. Upload flash package
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmi-N0Kernel-KernelSU-Next-v3.3.0-compat419-r2
+          path: cmi-N0Kernel-KernelSU-Next-v3.3.0-compat419-r2.zip
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload build diagnostics
+        if: alwaysname: Build Xiaomi 10 Pro - KernelSU Next v3.3.0
+
+run-name: cmi | N0Kernel 4.19 | KernelSU Next v3.3.0
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    env:
+      KSU_VERSION: v3.3.0
+      DEVICE: cmi
+
+    steps:
+      - name: 1. Prepare workspace
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/kernel_workspace"
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            git \
+            curl \
+            wget \
+            zip \
+            unzip \
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev \
+            ccache
+
+      - name: 2. Download Clang
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
+
+          wget -q \
+            https://github.com/ZyCromerZ/Clang/releases/download/19.0.0git-20240125-release/Clang-19.0.0git-20240125.tar.gz
+
+          mkdir -p clang
+
+          tar -xzf \
+            Clang-19.0.0git-20240125.tar.gz \
+            -C clang
+
+          clang/bin/clang --version
+
+      - name: 3. Clone N0Kernel source
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
+
+          git clone \
+            https://github.com/clcwpwqi/kernel_xiaomi_sm8250_n0kernel \
+            --depth=1 \
+            android_kernel
+
+          git -C android_kernel fetch --depth=1 origin 8e5ed277b141f94ed16cda850445f43b16305ce2
+          git -C android_kernel checkout --detach FETCH_HEAD
+
+          git clone \
+            https://github.com/clcwpwqi/kernel.git \
+            --depth=1 \
+            packaging
+
+      - name: 4. Integrate official KernelSU Next v3.3.0
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+
+          curl -LSs \
+            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/v3.3.0/kernel/setup.sh" \
+            | bash -s v3.3.0
+
+          echo "===== KernelSU source ====="
+          git -C KernelSU-Next describe --tags --always || true
+          git -C KernelSU-Next log -1 --oneline
+          test "$(git -C KernelSU-Next rev-parse HEAD)" = "3b18216f71df189ab3d1b1ce0bdb21be1268e771"
+
+      - name: 5. Generate cmi config
+        run: |
+          export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang/bin:$PATH"
+
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+
+          make -j"$(nproc)" \
+            O=out \
+            ARCH=arm64 \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-buildroot-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            vendor/cmi_defconfig
+
+      - name: 6. Enable KernelSU requirements
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+
+          ./scripts/config --file out/.config \
+            -e MODULES \
+            -e KPROBES \
+            -e EXT4_FS \
+            -e KSU
+
+          export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang/bin:$PATH"
+
+          make -j"$(nproc)" \
+            O=out \
+            ARCH=arm64 \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-buildroot-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            olddefconfig
+
+          echo "===== Verify KernelSU config ====="
+
+          grep -E \
+            'CONFIG_(MODULES|KPROBES|KSU|EXT4_FS)=' \
+            out/.config || true
+
+          if ! grep -q '^CONFIG_MODULES=y' out/.config; then
+            echo "ERROR: CONFIG_MODULES is not enabled"
+            exit 1
+          fi
+
+          if ! grep -q '^CONFIG_KPROBES=y' out/.config; then
+            echo "ERROR: CONFIG_KPROBES is not enabled"
+            exit 1
+          fi
+
+          if ! grep -q '^CONFIG_EXT4_FS=y' out/.config; then
+            echo "ERROR: CONFIG_EXT4_FS is not enabled"
+            exit 1
+          fi
+
+          if ! grep -q '^CONFIG_KSU=y' out/.config; then
+            echo "ERROR: CONFIG_KSU is not enabled"
+            exit 1
+          fi
+      - name: Fix KernelSU compatibility for N0Kernel 4.19
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+
+          KSU_FILE="KernelSU-Next/kernel/feature/sucompat.c"
+          test -f "$KSU_FILE"
+
+          if [ ! -f include/linux/pgtable.h ]; then
+            test -f arch/arm64/include/asm/pgtable.h
+            sed -i 's|#include <linux/pgtable.h>|#include <asm/pgtable.h>|' "$KSU_FILE"
+          fi
+
+          if ! grep -q 'strncpy_from_user_nofault' include/linux/uaccess.h; then
+            grep -q 'strncpy_from_unsafe_user' include/linux/uaccess.h
+            grep -q 'strncpy_from_unsafe_user' mm/maccess.c
+            sed -i 's/strncpy_from_user_nofault/strncpy_from_unsafe_user/g' "$KSU_FILE"
+          fi
+
+          echo "===== Verify compatibility changes ====="
+          grep -nE 'pgtable.h|strncpy_from_unsafe_user' "$KSU_FILE"
+      - name: Fix KernelSU kernel-write compatibility
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+
+          PATCH_FILE="KernelSU-Next/kernel/hook/arm64/patch_memory.c"
+          test -f "$PATCH_FILE"
+
+          if ! grep -q 'copy_to_kernel_nofault' include/linux/uaccess.h; then
+            grep -q 'probe_kernel_write' include/linux/uaccess.h
+            grep -q 'probe_kernel_write' mm/maccess.c
+            sed -i 's/copy_to_kernel_nofault/probe_kernel_write/g' "$PATCH_FILE"
+          fi
+
+          echo "===== Verify kernel-write compatibility ====="
+          grep -nE 'copy_to_kernel_nofault|probe_kernel_write' "$PATCH_FILE"
+          
+      - name: Adapt file wrapper for N0Kernel 4.19
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+          python3 - <<'PY'
+          """Targeted KernelSU Next v3.3.0 file-wrapper port for this N0Kernel 4.19.
+          
+          This is a downstream compatibility patch, not an upstream release.
+          It deliberately fails on unexpected source layouts.
+          """
+          from pathlib import Path
+          import re
+          
+          
+          def patch_wrapper(source, fs_header, security_header, objsec_header):
+              for member in ('clone_file_range', 'dedupe_file_range'):
+                  if not re.search(r'\(\*' + member + r'\)', fs_header):
+                      raise RuntimeError('Missing required 4.19 file operation: ' + member)
+              for member in ('iopoll', 'remap_file_range'):
+                  if re.search(r'\(\*' + member + r'\)', fs_header):
+                      raise RuntimeError('Unexpected backported operation: ' + member)
+              if 'security_inode_init_security_anon' in security_header:
+                  raise RuntimeError('Native anonymous-inode security hook exists; review port')
+              if re.search(r'\bselinux_inode\s*\(', objsec_header):
+                  raise RuntimeError('Unexpected SELinux blob layout; review port')
+              for token in ('LABEL_INITIALIZED', 'struct inode_security_struct', 'sclass'):
+                  if token not in objsec_header:
+                      raise RuntimeError('Unexpected SELinux definitions: ' + token)
+          
+              def replace_once(old, new):
+                  nonlocal source
+                  if source.count(old) != 1:
+                      raise RuntimeError('Expected exactly one source match: ' + old[:90])
+                  source = source.replace(old, new, 1)
+          
+              replace_once('#else\nstatic int ksu_wrapper_iopoll',
+                           '#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n'
+                           'static int ksu_wrapper_iopoll')
+              old = '    p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;'
+              replace_once(old, '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)\n'
+                           + old + '\n#endif')
+          
+              # 4.19 exposes clone and dedupe separately; preserve both forwarding paths.
+              old_start = 'static loff_t ksu_wrapper_remap_file_range('
+              replace_once(old_start, '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n'
+                           + old_start)
+              legacy_ops = '''#else
+          static int ksu_wrapper_clone_file_range(struct file *file_in, loff_t pos_in,
+                                                 struct file *file_out, loff_t pos_out,
+                                                 u64 len)
+          {
+              struct ksu_file_wrapper *data = file_in->private_data;
+              return data->orig->f_op->clone_file_range(data->orig, pos_in,
+                                                       file_out, pos_out, len);
+          }
+          
+          static int ksu_wrapper_dedupe_file_range(struct file *file_in, loff_t pos_in,
+                                                  struct file *file_out, loff_t pos_out,
+                                                  u64 len)
+          {
+              struct ksu_file_wrapper *data = file_out->private_data;
+              return data->orig->f_op->dedupe_file_range(file_in, pos_in,
+                                                        data->orig, pos_out, len);
+          }
+          #endif
+          
+          '''
+              replace_once('static int ksu_wrapper_fadvise(',
+                           legacy_ops + 'static int ksu_wrapper_fadvise(')
+              old = '''    p->ops.remap_file_range =
+                  fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;'''
+              replace_once(old, '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n'
+                           + old + '''
+          #else
+              p->ops.clone_file_range =
+                  fp->f_op->clone_file_range ? ksu_wrapper_clone_file_range : NULL;
+              p->ops.dedupe_file_range =
+                  fp->f_op->dedupe_file_range ? ksu_wrapper_dedupe_file_range : NULL;
+          #endif''')
+          
+              # This is local to KSU's private wrapper, not a substitute for a global LSM
+              # hook. The release already labels the wrapper with ksu_file_sid. On 4.19,
+              # initialize that label before the inode is published and keep S_PRIVATE
+              # until initialization succeeds. Do not change SELinux enforcement.
+              helper = '''/* N0Kernel 4.19 stores the SELinux inode blob in i_security. */
+          static int ksu_init_wrapper_security_419(struct inode *inode)
+          {
+              struct inode_security_struct *isec = inode->i_security;
+          
+              if (!isec || !ksu_file_sid)
+                  return -EINVAL;
+          
+              /* Private, freshly allocated inode; no concurrent readers yet. */
+              isec->sid = ksu_file_sid;
+              isec->sclass = SECCLASS_FILE;
+              isec->initialized = LABEL_INITIALIZED;
+              return 0;
+          }
+          
+          '''
+              replace_once('static struct inode *\nksu_anon_inode_make_secure_inode(',
+                           helper + 'static struct inode *\nksu_anon_inode_make_secure_inode(')
+              replace_once('    const struct qstr qname = QSTR_INIT(name, strlen(name));\n', '')
+              old = '''    inode->i_flags &= ~S_PRIVATE;
+              error = security_inode_init_security_anon(inode, &qname, context_inode);
+              if (error) {
+                  iput(inode);
+                  return ERR_PTR(error);
+              }
+              return inode;'''
+              new = '''    error = ksu_init_wrapper_security_419(inode);
+              if (error) {
+                  iput(inode);
+                  return ERR_PTR(error);
+              }
+              inode->i_flags &= ~S_PRIVATE;
+              return inode;'''
+              replace_once(old, new)
+              replace_once('selinux_inode(wrapper_inode)', 'wrapper_inode->i_security')
+              return source
+          
+          
+          def main():
+              version = Path('Makefile').read_text()
+              if not (re.search(r'^VERSION\s*=\s*4\s*$', version, re.M)
+                      and re.search(r'^PATCHLEVEL\s*=\s*19\s*$', version, re.M)):
+                  raise RuntimeError('This compatibility patch is only for N0Kernel 4.19')
+              config = Path('out/.config').read_text()
+              if 'CONFIG_SECURITY_SELINUX=y' not in config:
+                  raise RuntimeError('This port requires CONFIG_SECURITY_SELINUX=y')
+              target = Path('KernelSU-Next/kernel/infra/file_wrapper.c')
+              result = patch_wrapper(
+                  target.read_text(), Path('include/linux/fs.h').read_text(),
+                  Path('include/linux/security.h').read_text(),
+                  Path('security/selinux/include/objsec.h').read_text())
+              target.write_text(result)
+              print('Applied N0Kernel 4.19 file-wrapper compatibility patch')
+          
+          
+          if __name__ == '__main__':
+              main()
+          PY
+          git -C KernelSU-Next diff -- kernel > "$GITHUB_WORKSPACE/compat419.diff"
+          { git rev-parse HEAD; git -C KernelSU-Next rev-parse HEAD; } > "$GITHUB_WORKSPACE/source-revisions.txt"
+
+      - name: Adapt seccomp helpers for kernel without action cache
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          import re
+          
+          native = Path("kernel/seccomp.c").read_text()
+          native_code = re.sub(r"/\*.*?\*/|//[^\n]*", "", native, flags=re.S)
+          match = re.search(r"struct seccomp_filter\s*\{([^}]+)\};", native_code)
+          expected = "refcount_t usage; bool log; struct seccomp_filter *prev; struct bpf_prog *prog;"
+          normalize = lambda s: re.sub(r"\s+", "", s)
+          if not match or normalize(match.group(1)) != normalize(expected):
+              raise RuntimeError("Unexpected native seccomp_filter layout; review required")
+          if re.search(r"\baction_cache\b|\bcache\b", native_code):
+              raise RuntimeError("Native seccomp cache detected; do not apply no-cache adapter")
+          if "BPF_PROG_RUN(f->prog, sd)" not in native_code:
+              raise RuntimeError("Expected native BPF filtering path is missing")
+          
+          target = Path("KernelSU-Next/kernel/infra/seccomp_cache.c")
+          source = target.read_text()
+          digest = hashlib.sha256(source.strip().encode()).hexdigest()
+          if digest != "be0f193ee23a323d39c9d33b4e928a128d10e3b0a9ccd333e01b9335cd5ef65f":
+              raise RuntimeError("Unexpected KernelSU cache source; review required")
+          
+          target.write_text("""// SPDX-License-Identifier: GPL-2.0-only
+          /*
+           * This pinned N0Kernel 4.19 has no seccomp action cache.
+           * Cache maintenance is therefore empty. Native BPF filtering remains intact.
+           * Never access the newer kernel's private seccomp_filter layout on 4.19.
+           */
+          #include <linux/seccomp.h>
+          #include "infra/seccomp_cache.h"
+          
+          void ksu_seccomp_clear_cache(struct seccomp_filter *filter, int nr)
+          {
+              (void)filter;
+              (void)nr;
+          }
+          
+          void ksu_seccomp_allow_cache(struct seccomp_filter *filter, int nr)
+          {
+              (void)filter;
+              (void)nr;
+          }
+          """)
+          print("Applied seccomp no-cache adapter; native kernel/seccomp.c unchanged")
+          PY
+          git -C KernelSU-Next diff -- kernel > "$GITHUB_WORKSPACE/compat419.diff"
+
+      - name: 7. Build kernel
+        run: |
+          set -o pipefail
+          export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang/bin:$PATH"
+
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+
+          make -j"$(nproc)" \
+            O=out \
+            ARCH=arm64 \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: 8. Verify kernel Image
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace/android_kernel"
+
+          IMAGE="out/arch/arm64/boot/Image"
+
+          if [ ! -f "$IMAGE" ]; then
+            echo "ERROR: Kernel Image was not generated"
+            exit 1
+          fi
+
+          ls -lh "$IMAGE"
+
+          echo "===== Linux version ====="
+          strings "$IMAGE" | grep -m1 "Linux version" || true
+
+          echo "===== KernelSU strings ====="
+          strings "$IMAGE" | grep -i -m10 "KernelSU" || true
+
+      - name: 9. Create AnyKernel3 flash package
+        run: |
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
+
+          mkdir -p packaging/Anykernel/kernels/miui
+
+          cp \
+            android_kernel/out/arch/arm64/boot/Image \
+            packaging/Anykernel/kernels/miui/Image
+
+          cd packaging/Anykernel
+
+          zip -r \
+            "$GITHUB_WORKSPACE/cmi-N0Kernel-KernelSU-Next-v3.3.0-compat419-r2.zip" \
+            .
+
+          ls -lh \
+            "$GITHUB_WORKSPACE/cmi-N0Kernel-KernelSU-Next-v3.3.0-compat419-r2.zip"
+
+      - name: 10. Upload flash package
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmi-N0Kernel-KernelSU-Next-v3.3.0-compat419-r2
+          path: cmi-N0Kernel-KernelSU-Next-v3.3.0-compat419-r2.zip
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmi-build-diagnostics
+          if-no-files-found: warn
+          path: |
+            build.log
+            compat419.diff
+            source-revisions.txt
+            kernel_workspace/android_kernel/out/.config
+          include-hidden-files: true
+          retention-days: 7
+
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmi-build-diagnostics
+          if-no-files-found: warn
+          path: |
+            build.log
+            compat419.diff
+            source-revisions.txt
+            kernel_workspace/android_kernel/out/.config
+          include-hidden-files: true
+          retention-days: 7
 
     env:
       KSU_VERSION: v3.3.0
